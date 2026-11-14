@@ -2,7 +2,7 @@
 
 通过 Chrome 或 Edge 的 WebHID 功能给 WITRN K2 刷写固件。网页为单文件，无需安装软件。
 
-**在线使用：** https://niu541412.github.io/WITRN_K2/
+**在线使用：** https://niu541412.github.io/WITRN_K2_flash/
 
 ## 使用方法
 
