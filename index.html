@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>WITRN K2 刷机工具 (WebHID)</title>
+<style>
+  :root { --bg:#111318; --card:#1a1e26; --acc:#4f9cf9; --ok:#3ecf8e; --warn:#f5a623; --err:#ff5c5c; --fg:#e8eaf0; --dim:#8b93a5; }
+  * { box-sizing:border-box; }
+  body { background:var(--bg); color:var(--fg); font:15px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; margin:0; padding:24px; }
+  .wrap { max-width:720px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:20px; }
+  .card { background:var(--card); border-radius:12px; padding:18px 20px; margin-bottom:14px; }
+  .card h2 { font-size:15px; margin:0 0 10px; color:var(--acc); font-weight:600; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:99px; font-size:12px; margin-left:8px; vertical-align:middle; }
+  .pill.ok { background:rgba(62,207,142,.15); color:var(--ok); }
+  .pill.err { background:rgba(255,92,92,.15); color:var(--err); }
+  .pill.warn { background:rgba(245,166,35,.15); color:var(--warn); }
+  button { background:var(--acc); color:#fff; border:none; border-radius:8px; padding:10px 20px; font-size:15px; cursor:pointer; margin-right:8px; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  button.ghost { background:transparent; border:1px solid var(--dim); color:var(--fg); }
+  button.danger { background:var(--err); }
+  .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:8px 0; }
+  .info { font-size:13px; color:var(--dim); }
+  .kv { font-size:14px; margin:4px 0; }
+  .kv b { color:var(--fg); font-weight:600; }
+  label.radiolabel { margin-right:16px; cursor:pointer; }
+  #bar { height:10px; background:#2a2f3a; border-radius:6px; overflow:hidden; margin:10px 0 6px; }
+  #barfill { height:100%; width:0%; background:linear-gradient(90deg,var(--acc),var(--ok)); transition:width .3s; }
+  #log { background:#0c0e12; border-radius:8px; padding:10px 12px; font:12px/1.5 ui-monospace,Menlo,monospace; max-height:180px; overflow-y:auto; white-space:pre-wrap; color:#a8b3c7; margin-top:10px; }
+  .phase { font-size:14px; margin-top:6px; }
+  .hide { display:none; }
+  input[type=file] { color:var(--dim); }
+  .note { font-size:12.5px; color:var(--dim); border-left:3px solid var(--acc); padding:6px 12px; margin-top:10px; }
+  a { color:var(--acc); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>WITRN K2 刷机工具 <span class="pill warn">WebHID</span></h1>
+  <div class="sub">仅支持 Chrome / Edge。协议逆向版（2026-10-12），与 Windows 官方工具流程逐字节等价。<br>
+    <a href="https://github.com/niu541412/WITRN_K2" target="_blank" rel="noopener noreferrer">GitHub 源码</a>
+  </div>
+
+  <div class="card">
+    <h2>① 连接设备</h2>
+    <div class="row">
+      <button id="btnConnect">连接 K2 (DFU)</button>
+      <span id="devStatus" class="info">未连接</span>
+    </div>
+    <div class="info">设备需处于 DFU 模式：<b>按住设备按键插入 USB</b>（PID 0x5060）。</div>
+  </div>
+
+  <div class="card">
+    <h2>② 选择固件 (.k2)</h2>
+    <div class="row"><input type="file" id="fileK2" accept=".k2"></div>
+    <div id="fwInfo" class="hide">
+      <div class="kv">文件：<b id="fwName"></b></div>
+      <div class="kv">解密镜像：<b id="fwSize"></b> 字节 <span id="fwVec"></span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>③ 刷机</h2>
+    <div class="row">
+      <button id="btnFlash" class="danger" disabled>开始刷机</button>
+      <button id="btnAbort" class="ghost" disabled>中止</button>
+    </div>
+    <div id="bar" class="hide"><div id="barfill"></div></div>
+    <div id="phase" class="phase hide"></div>
+    <div id="stat" class="info"></div>
+    <div id="log"></div>
+  </div>
+
+  <div class="note">
+    ⚠️ 刷机会<b>擦除并重写</b>设备固件（约 1~1.5 分钟）。中途任何异常：拔插设备重来；固件损坏也可按住按键插 USB 回到 DFU 恢复。<br>
+    若按钮无效（无 WebHID）：请用 Chrome/Edge 打开；必要时 <code>python3 -m http.server</code> 后访问 localhost。
+  </div>
+</div>
+
+<script>
+// k2_core.js — WITRN K2 DFU core logic (browser + node shared)
+// Protocol reverse-engineered 2026-10-12; see K2_DFU协议_破解报告.md
+"use strict";
+
+function hexToBytes(h) {
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
+  return out;
+}
+
+const SBOX = hexToBytes("28afbdd4788088d3a38dcf386e97a2c077431170a047b99cf43a000ef095eed7ece850fbd5b3f3b1c6391a2ccb182ad99a7bdaa6c10c858e2fabb56707147a16ba73a4db34aa46197ee2e36b6fae25741b894b5153a85e1ffe2b5d138a6acd2922bb40716d864d7fd183b4c459b865c2923e5a3656ca991268b7b60408ad371533ce2021e660bf9426ffe58c05f1326909445cef9df53dea82faa52445dce063fde7d8c8bc4a795b919054be4e9b663b589f4f3f55a701027d4c75e1df1787847262491d488f2e8b31f7ccb0c9d6645727ed0a819306e4de3ca996101cf8c7e99e7c6cac7642415ffc0ff9c361a152b230030d980bddf6c5d22dd0f22335eb1e");
+const INV = (() => {
+  const t = new Uint8Array(256);
+  for (let x = 0; x < 256; x++) t[SBOX[x]] = x;
+  return t;
+})();
+
+const T_SAME = {
+  BULK_ERASE_DELAY: 9.74,
+  INIT: [
+  hexToBytes("0a0500400008010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("0a05fa300008060000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+],
+  POST_ERASE: [
+  hexToBytes("030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("0b0600300008000400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("0b0600140008000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("160000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("1534010000000a65617273696e672e2e2e00000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+],
+  WRITE_INTRO: [
+  hexToBytes("040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("153401000800026f6b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("1534010010000e696e7374616c6c206170702e2e2e000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+],
+  VERIFY_INTRO: [
+  hexToBytes("040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("153401001800026f6b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("1534010020000d766572696679206170702e2e2e00000000000000000000000000000000000000000000000000000000000000000000")
+],
+  FINAL: [
+  hexToBytes("153401002800026f6b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("09090044000804feffffff00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("0a0500440008040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  hexToBytes("170000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+],
+  ERASE_EXEMPLAR: hexToBytes("080400600008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  VERIFY_EXEMPLAR: hexToBytes("0b0600380008000400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+  WRITE40_EXEMPLAR: hexToBytes("092d0038000828507d0120113b0008556f0008fd3f0008516f0008f93f0008658e000800000000000000000000000000000000000000"),
+  WRITE24_EXEMPLAR: hexToBytes("091de83b0008188fff01214ff4017011f0aeff10a80ff0fffd0220adf840000000000000000000000000000000000000000000000000"),
+};
+
+
+
+const TPL = T_SAME;
+const APP_BASE = 0x08003800;
+
+function decryptK2(fileBytes) {
+  if (fileBytes.length < 56) throw new Error("file too small");
+  const image = new Uint8Array(fileBytes.length - 48);
+  for (let i = 48; i < fileBytes.length; i++) image[i - 48] = INV[fileBytes[i]];
+  return image;
+}
+
+function validateImage(img) {
+  const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
+  const sp = dv.getUint32(0, true) >>> 0;
+  const rst = dv.getUint32(4, true) >>> 0;
+  const ok = sp >= 0x20000000 && sp < 0x20080000 &&
+             rst >= 0x08000000 && rst < 0x08100000 && (rst & 1) === 1;
+  return { sp: sp, rst: rst, ok: ok };
+}
+
+function makeReport(payload54, addr, dlen, data, dataOff) {
+  const r = new Uint8Array(64);
+  r[0] = 0xff; r[1] = 0x55;
+  r.set(payload54, 8);
+  if (addr !== undefined) {
+    r[10] = addr & 0xff; r[11] = (addr >>> 8) & 0xff;
+    r[12] = (addr >>> 16) & 0xff; r[13] = (addr >>> 24) & 0xff;
+  }
+  if (dlen !== undefined) {
+    r[9] = dlen + 5;
+    r[14] = dlen;
+    for (let k = 0; k < dlen; k++) r[15 + k] = data[dataOff + k];
+  }
+  let s = 0;
+  for (let i = 8; i < 62; i++) s = (s + r[i]) & 0xff;
+  r[62] = s;
+  let s2 = 0;
+  for (let i = 0; i < 62; i++) s2 = (s2 + r[i]) & 0xff;
+  r[63] = s2;
+  return r;
+}
+
+function buildStream(image, T) {
+  const n = image.length;
+  const stream = []; // {delay, report, phase}
+  let phase = 'init';
+  const add = (delay, payload54, addr, dlen, data, dataOff) =>
+    stream.push({ delay: delay, report: makeReport(payload54, addr, dlen, data, dataOff), phase: phase });
+
+  const roundGap = 0.005;
+  T.INIT.forEach((p, k) => add(k === 0 ? 0 : (k % 2 === 0 ? roundGap : 0.005), p));
+
+  phase = 'erase';
+  T.POST_ERASE.forEach((p, k) => add(k === 0 ? 1.0 : 0.02, p));
+
+  let addr = APP_BASE, i = 0;
+  while (addr < APP_BASE + n) {
+    add(i < 3 ? 0.002 : 0.043, T.ERASE_EXEMPLAR, addr);
+    addr += 2048; i++;
+  }
+
+  phase = 'write';
+  T.WRITE_INTRO.forEach((p, k) => add(k === 0 ? 0.05 : 0.02, p));
+
+  let off = 0;
+  while (off < n) {
+    const blockLen = Math.min(1024, n - off);
+    let p = 0;
+    while (blockLen - p >= 40) {
+      add(0.001, T.WRITE40_EXEMPLAR, APP_BASE + off + p, 40, image, off + p);
+      p += 40;
+    }
+    if (p < blockLen)
+      add(0.001, T.WRITE24_EXEMPLAR, APP_BASE + off + p, blockLen - p, image, off + p);
+    off += blockLen;
+  }
+
+  phase = 'verify';
+  T.VERIFY_INTRO.forEach((p, k) => add(k === 0 ? 0.4 : 0.02, p));
+
+  const blocks = Math.ceil(n / 1024);
+  for (let b = 0; b < blocks - 1; b++)
+    add(0.03, T.VERIFY_EXEMPLAR, APP_BASE + b * 1024);
+  {
+    const r = new Uint8Array(64);
+    r[0] = 0xff; r[1] = 0x55; r[8] = 0x0b; r[9] = 0x06;
+    const addr2 = APP_BASE + (blocks - 1) * 1024;
+    r[10] = addr2 & 0xff; r[11] = (addr2 >>> 8) & 0xff;
+    r[12] = (addr2 >>> 16) & 0xff; r[13] = (addr2 >>> 24) & 0xff;
+    r[14] = 0x70; r[15] = 0x02;
+    let s = 0; for (let k = 8; k < 62; k++) s = (s + r[k]) & 0xff; r[62] = s;
+    let s2 = 0; for (let k = 0; k < 62; k++) s2 = (s2 + r[k]) & 0xff; r[63] = s2;
+    stream.push({ delay: 0.04, report: r });
+  }
+
+  phase = 'final';
+  T.FINAL.forEach(p => add(0.02, p));
+  return stream;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { SBOX: SBOX, INV: INV, TPL: TPL, decryptK2: decryptK2,
+                     validateImage: validateImage, buildStream: buildStream,
+                     makeReport: makeReport, hexToBytes: hexToBytes };
+}
+
+
+// ---------- WebHID UI ----------
+(function () {
+  const $ = id => document.getElementById(id);
+  const logEl = $('log');
+  function log(msg) {
+    logEl.textContent += msg + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  let backgroundChannel = null;
+  let backgroundWaiter = null;
+  function sleep(ms) {
+    if (!document.hidden || ms >= 100) return new Promise(r => setTimeout(r, ms));
+    if (!backgroundChannel) {
+      backgroundChannel = new MessageChannel();
+      backgroundChannel.port1.onmessage = () => {
+        const waiter = backgroundWaiter;
+        if (!waiter) return;
+        if (performance.now() < waiter.deadline) {
+          backgroundChannel.port2.postMessage(0);
+        } else {
+          backgroundWaiter = null;
+          waiter.resolve();
+        }
+      };
+    }
+    return new Promise(resolve => {
+      backgroundWaiter = { deadline: performance.now() + ms, resolve };
+      backgroundChannel.port2.postMessage(0);
+    });
+  }
+  function phaseTotals0(stream, ph) { let n = 0; for (const s of stream) if (s.phase === ph) n++; return n; }
+
+  let device = null;
+  let image = null;
+  let fwReady = false;
+  let devReady = false;
+  let abortFlag = false;
+  let inCount = 0;
+  let versionWaiter = null;
+
+  function updateFlashBtn() {
+    $('btnFlash').disabled = !(devReady && fwReady);
+  }
+
+  function inputHandler(e) {
+    inCount++;
+    const u8 = new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength);
+    if (u8.length >= 11 && u8[8] === 0x0a && u8[9] === 0x01 && versionWaiter) {
+      versionWaiter(u8[10]); versionWaiter = null;
+    }
+  }
+
+  $('btnConnect').onclick = async () => {
+    if (!navigator.hid) { log('✗ 此浏览器不支持 WebHID，请用 Chrome/Edge'); return; }
+    try {
+      const devices = await navigator.hid.requestDevice({ filters: [{ vendorId: 0x0716, productId: 0x5060 }] });
+      if (!devices.length) { log('未选择设备'); return; }
+      device = devices[0];
+      await device.open();
+      device.addEventListener('inputreport', inputHandler);
+      navigator.hid.addEventListener('disconnect', e => {
+        if (e.device === device) { devReady = false; device = null; $('devStatus').textContent = '已断开'; updateFlashBtn(); }
+      });
+      // query version
+      const q = makeReport(hexToBytes('0a05004000080100' + '00'.repeat(39)));
+      const ver = await new Promise(resolve => {
+        versionWaiter = resolve;
+        device.sendReport(0, q).catch(() => resolve(null));
+        setTimeout(() => { versionWaiter = null; resolve(null); }, 1500);
+      });
+      const vs = ver === null ? '未知' : ((ver >> 4) + '.' + (ver & 0xf));
+      devReady = true;
+      $('devStatus').innerHTML = '已连接 ' + (device.productName || 'WITRN.K2') +
+        ' <span class="pill ok">固件 ' + vs + '</span>';
+      log('✓ 设备已连接，当前固件版本: ' + vs + (ver === null ? '（查询超时，可继续）' : ''));
+      updateFlashBtn();
+    } catch (err) {
+      log('✗ 连接失败: ' + err.message);
+    }
+  };
+
+  $('fileK2').onchange = async ev => {
+    const f = ev.target.files[0];
+    if (!f) return;
+    const buf = new Uint8Array(await f.arrayBuffer());
+    try {
+      image = decryptK2(buf);
+      const v = validateImage(image);
+      $('fwName').textContent = f.name;
+      $('fwSize').textContent = image.length.toLocaleString();
+      $('fwVec').innerHTML = v.ok
+        ? '<span class="pill ok">向量表校验通过</span>'
+        : '<span class="pill err">向量表非法！S-Box 可能已更换，勿刷</span>';
+      $('fwInfo').classList.remove('hide');
+      fwReady = v.ok;
+      log((v.ok ? '✓' : '✗') + ' 固件解密完成: ' + f.name + ' (' + image.length + 'B, SP=' +
+          v.sp.toString(16) + ' reset=' + v.rst.toString(16) + ')');
+    } catch (err) {
+      fwReady = false;
+      log('✗ 固件解析失败: ' + err.message);
+    }
+    updateFlashBtn();
+  };
+
+  $('btnAbort').onclick = () => { abortFlag = true; log('… 正在中止（设备可能需要拔插）'); };
+
+  $('btnFlash').onclick = async () => {
+    if (!device || !image) return;
+    if (!confirm('将擦除并重写设备固件，确认继续？')) return;
+    const stream = buildStream(image, TPL);
+    const est = Math.round(stream.reduce((a, s) => a + s.delay, 0));
+    log('▶ 开始刷机: 擦除 ' + phaseTotals0(stream, 'erase') + ' 扇区 · 写入 ' +
+        phaseTotals0(stream, 'write') + ' 块 · 检验 ' + phaseTotals0(stream, 'verify') +
+        ' 块, 共 ' + stream.length + ' 个包, 预计 ~' + est + 's');
+    $('btnFlash').disabled = true; $('btnAbort').disabled = false;
+    $('bar').classList.remove('hide'); $('phase').classList.remove('hide');
+    abortFlag = false; inCount = 0;
+    const t0 = performance.now();
+    try {
+      const PH = { init: '握手', erase: '① 擦除', write: '② 写入', verify: '③ 检验', final: '收尾' };
+      const phaseTotals = {};
+      for (const s of stream) phaseTotals[s.phase] = (phaseTotals[s.phase] || 0) + 1;
+      const phaseDone = {};
+      for (let k = 0; k < stream.length; k++) {
+        if (abortFlag) throw new Error('用户中止');
+        const step = stream[k];
+        phaseDone[step.phase] = (phaseDone[step.phase] || 0) + 1;
+        if (step.delay > 0) await sleep(step.delay * 1000);
+        try {
+          await device.sendReport(0, step.report);
+        } catch (e) {
+          throw new Error('包 #' + k + ' 发送失败: ' + e.message + ' — 设备锁死/断开，请拔插后重试');
+        }
+        if (k % 100 === 0 || k === stream.length - 1) {
+          const done = k + 1;
+          const pct = (done / stream.length * 100).toFixed(1);
+          $('barfill').style.width = pct + '%';
+          $('phase').textContent = PH[step.phase] + ' · ' +
+            phaseDone[step.phase] + ' / ' + phaseTotals[step.phase];
+          $('stat').textContent = '总进度 ' + done + ' / ' + stream.length + ' (' + pct + '%) · ' +
+            ((performance.now() - t0) / 1000).toFixed(0) + 's';
+          await sleep(0);
+        }
+      }
+      $('barfill').style.width = '100%';
+      $('phase').textContent = '✅ 完成，等待设备重启…';
+      log('✅ 全部 ' + stream.length + ' 个包发送完成，设备应自动重启进入新固件');
+      await sleep(8000);
+      try { await device.close(); } catch (e) {}
+      device = null; devReady = false;
+      $('devStatus').textContent = '未连接（设备已重启）';
+    } catch (err) {
+      log('✗ ' + err.message);
+      $('phase').textContent = '❌ 失败';
+      try { await device.close(); } catch (e) {}
+      device = null; devReady = false;
+      $('devStatus').textContent = '未连接';
+    }
+    $('btnAbort').disabled = true;
+    updateFlashBtn();
+  };
+})();
+</script>
+</body>
+</html>
